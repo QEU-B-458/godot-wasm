@@ -1,0 +1,145 @@
+name: Godot WASM Addon (Manual)
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to upload builds to"
+        required: true
+
+env:
+  PROFILE: debug
+  ADDON_PATH: out/addons/godot_wasm
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            name: linux_x86_64
+
+          - target: aarch64-unknown-linux-gnu
+            name: linux_arm64
+
+          - target: x86_64-pc-windows-gnu
+            name: windows_x86_64
+
+          - target: aarch64-linux-android
+            name: android_arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            unzip zip curl openjdk-17-jdk \
+            mingw-w64 gcc-aarch64-linux-gnu
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }},wasm32-unknown-unknown
+          components: clippy,rustfmt
+
+      # -----------------------------
+      # Configure linkers
+      # -----------------------------
+      - name: Configure cross linkers
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+
+          [target.x86_64-pc-windows-gnu]
+          linker = "x86_64-w64-mingw32-gcc"
+          EOF
+
+      # -----------------------------
+      # Android NDK
+      # -----------------------------
+      - name: Setup Android NDK
+        if: contains(matrix.target, 'android')
+        uses: android-actions/setup-android@v3
+
+      - name: Configure Android linker
+        if: contains(matrix.target, 'android')
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          EOF
+
+      # -----------------------------
+      # Build addon (matches deploy-addon)
+      # -----------------------------
+      - name: Build godot-wasm
+        run: |
+          cargo build -p godot-wasm \
+            --target ${{ matrix.target }} \
+            --profile dev
+
+      # -----------------------------
+      # Copy built library into addon bin/<triple>
+      # -----------------------------
+      - name: Deploy addon binary
+        run: |
+          TARGET_DIR=target/${{ matrix.target }}/debug
+          OUT_DIR=${{ env.ADDON_PATH }}/bin/${{ matrix.target }}
+
+          mkdir -p $OUT_DIR
+
+          find $TARGET_DIR -maxdepth 1 -type f \
+            \( -name "godot_wasm.dll" \
+               -o -name "godot_wasm.so" \
+               -o -name "libgodot_wasm.so" \
+               -o -name "libgodot_wasm.dylib" \) \
+            -exec cp {} $OUT_DIR \;
+
+      # -----------------------------
+      # Build WASM examples
+      # -----------------------------
+      - name: Build WASM examples
+        run: |
+          for dir in example/wasm/*; do
+            if [ -d "$dir" ] && [ "$(basename $dir)" != ".cargo" ]; then
+              name=$(basename $dir)
+              cargo build -p $name \
+                --target wasm32-unknown-unknown \
+                --profile dev \
+                --config ./example/wasm/.cargo/config.toml
+            fi
+          done
+
+      - name: Copy WASM outputs
+        run: |
+          mkdir -p example/wasm
+          find target/wasm32-unknown-unknown/debug -name "*.wasm" \
+            -exec cp {} example/wasm/ \;
+
+      # -----------------------------
+      # Package addon
+      # -----------------------------
+      - name: Package addon
+        run: |
+          mkdir -p release
+          cp -r out/addons release/
+          cd release
+          zip -r godot_wasm_${{ matrix.name }}.zip addons
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          files: release/godot_wasm_${{ matrix.name }}.zip
